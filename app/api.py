@@ -31,7 +31,7 @@ log = logging.getLogger("api")
 
 router = APIRouter(prefix="/api")
 
-IMMICH_EXTERNAL_URL = os.environ.get("IMMICH_EXTERNAL_URL", "http://localhost:2283")
+IMMICH_EXTERNAL_URL = os.environ.get("IMMICH_EXTERNAL_URL") or os.environ.get("IMMICH_URL") or "http://localhost:2283"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 PETS_DIR = DATA_DIR / "pets"
 LONG_REQUEST_TIMEOUT = int(os.environ.get("LONG_REQUEST_TIMEOUT", 120))
@@ -77,6 +77,16 @@ class PetAssets(BaseModel):
     asset_ids: list[str]
 
 
+class SkippedAssets(BaseModel):
+    asset_ids: list[str]
+    pet_name: Optional[str] = None
+
+
+class SkipAsRefAssets(BaseModel):
+    asset_ids: list[str]
+    pet_name: Optional[str] = None
+
+
 class CropRef(BaseModel):
     asset_id: str
     crop_idx: Optional[int] = None
@@ -100,10 +110,38 @@ async def get_version():
 
 @router.get("/config")
 async def get_config():
+    yolo_model = det.get_yolo_model()
+    yolo_path = Path(yolo_model)
+    yolo_candidates = [yolo_path] if yolo_path.is_absolute() else [DATA_DIR / yolo_model, Path.cwd() / yolo_model, Path(__file__).resolve().parent / yolo_model]
+    yolo_file_present = any(p.exists() for p in yolo_candidates)
+
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    clip_dirs = [
+        cache_root / "clip",
+        cache_root / "huggingface" / "hub",
+    ]
+    clip_file_present = False
+    for d in clip_dirs:
+        if not d.exists():
+            continue
+        if d.name == "clip":
+            if any(d.glob("*.pt")):
+                clip_file_present = True
+                break
+        else:
+            if any(d.glob("*ViT-B-16*")):
+                clip_file_present = True
+                break
+
+    models_ready = det.is_yolo_ready() and emb.is_clip_ready()
     return {
         "immich_external_url": IMMICH_EXTERNAL_URL,
-        "models_ready": det.is_yolo_ready() and emb.is_clip_ready(),
+        "yolo_model": yolo_model,
+        "models_ready": models_ready,
         "models_error": det.get_yolo_error() or emb.get_clip_error(),
+        "yolo_file_present": yolo_file_present,
+        "clip_file_present": clip_file_present,
+        "model_files_present": yolo_file_present and clip_file_present,
     }
 
 
@@ -114,7 +152,7 @@ def _require_inference():
         detail = (
             f"Models are not ready yet: {err}"
             if err
-            else "Models are still loading. On first start, yolov8n.pt (~6 MB) and the CLIP model (~350 MB) are downloaded. "
+            else f"Models are still loading. On first start, {det.get_yolo_model()} (~6 MB) and the CLIP model (~350 MB) are downloaded. "
                  "Ensure the container has internet access, then retry. "
                  "To use offline, copy the model files to the data volume manually (see README)."
         )
@@ -387,12 +425,123 @@ async def remove_negative(asset_id: str):
 # Skipped
 # ---------------------------------------------------------------------------
 
+@router.get("/skipped/{pet_name}")
+async def get_skipped(pet_name: str):
+    """Get skipped asset IDs and thumbnails for a specific pet."""
+    skipped_ids = data.load_skipped_ids(DATA_DIR, pet_name)
+    
+    # Return basic info without fetching full asset metadata
+    # The UI will load thumbnails on-demand which is much faster
+    assets = [
+        {
+            "id": asset_id,
+            "thumb": f"/api/thumb/{asset_id}",
+            "filename": "",  # Will be shown on hover/in Immich
+            "date": ""
+        }
+        for asset_id in skipped_ids
+    ]
+    
+    return {"assets": assets, "count": len(assets), "pet_name": pet_name}
+
+
 @router.post("/skipped")
-async def add_skipped(body: PetAssets):
-    existing = set(data.load_skipped_ids(DATA_DIR))
+async def add_skipped(body: SkippedAssets):
+    pet_name = body.pet_name.strip() if body.pet_name else None
+    existing = set(data.load_skipped_ids(DATA_DIR, pet_name))
     merged = list(existing | set(body.asset_ids))
-    data.save_skipped_ids(merged, DATA_DIR)
-    return {"count": len(merged)}
+    data.save_skipped_ids(merged, DATA_DIR, pet_name)
+    return {"count": len(merged), "pet_name": pet_name}
+
+
+@router.delete("/skipped/{asset_id}")
+async def remove_skipped(asset_id: str, pet_name: Optional[str] = None):
+    """Remove an asset from the skipped list for a specific pet or globally."""
+    pet_filter = pet_name.strip() if pet_name else None
+    
+    # Load the current skipped map
+    skipped_map = data._load_skipped_map(DATA_DIR)
+    removed = False
+    
+    # If a specific pet is provided, only remove from that pet's list
+    if pet_filter:
+        if pet_filter in skipped_map:
+            pet_skipped = skipped_map[pet_filter]
+            if asset_id in pet_skipped:
+                pet_skipped.remove(asset_id)
+                removed = True
+    else:
+        # Remove from all pets' skipped lists
+        for pet_list in skipped_map.values():
+            if asset_id in pet_list:
+                pet_list.remove(asset_id)
+                removed = True
+    
+    if removed:
+        data_dir_path = DATA_DIR / "skipped.json"
+        data._atomic_write(data_dir_path, json.dumps(skipped_map, indent=2))
+        log.info(f"Removed {asset_id} from skipped list" + (f" for pet '{pet_filter}'" if pet_filter else " (all pets)"))
+    
+    return {"removed": removed, "asset_id": asset_id, "pet_name": pet_filter}
+
+
+# ---------------------------------------------------------------------------
+# Skip-as-reference
+# ---------------------------------------------------------------------------
+
+@router.get("/skip-as-ref/{pet_name}")
+async def get_skip_as_ref(pet_name: str):
+    """Get skip-as-reference asset IDs and thumbnails for a specific pet."""
+    skipped_ids = data.load_skip_as_ref_ids(DATA_DIR, pet_name)
+
+    assets = [
+        {
+            "id": asset_id,
+            "thumb": f"/api/thumb/{asset_id}",
+            "filename": "",
+            "date": "",
+        }
+        for asset_id in skipped_ids
+    ]
+
+    return {"assets": assets, "count": len(assets), "pet_name": pet_name}
+
+
+@router.post("/skip-as-ref")
+async def add_skip_as_ref(body: SkipAsRefAssets):
+    pet_name = body.pet_name.strip() if body.pet_name else None
+    existing = set(data.load_skip_as_ref_ids(DATA_DIR, pet_name))
+    merged = list(existing | set(body.asset_ids))
+    data.save_skip_as_ref_ids(merged, DATA_DIR, pet_name)
+    return {"count": len(merged), "pet_name": pet_name}
+
+
+@router.delete("/skip-as-ref/{asset_id}")
+async def remove_skip_as_ref(asset_id: str, pet_name: Optional[str] = None):
+    """Remove an asset from the skip-as-reference list for a specific pet or globally."""
+    pet_filter = pet_name.strip() if pet_name else None
+
+    skip_map = data._load_skip_as_ref_map(DATA_DIR)
+    removed = False
+
+    if pet_filter:
+        if pet_filter in skip_map:
+            pet_skipped = skip_map[pet_filter]
+            if asset_id in pet_skipped:
+                pet_skipped.remove(asset_id)
+                removed = True
+    else:
+        for pet_list in skip_map.values():
+            if asset_id in pet_list:
+                pet_list.remove(asset_id)
+                removed = True
+
+    if removed:
+        data_dir_path = DATA_DIR / "skip_as_ref.json"
+        data._atomic_write(data_dir_path, json.dumps(skip_map, indent=2))
+        log.info(f"Removed {asset_id} from skip-as-reference list" + (f" for pet '{pet_filter}'" if pet_filter else " (all pets)"))
+
+    return {"removed": removed, "asset_id": asset_id, "pet_name": pet_filter}
 
 
 # ---------------------------------------------------------------------------
@@ -442,33 +591,44 @@ async def set_pet_assets(name: str, body: PetCropAssets):
         existing_refs_by_id.setdefault(r["asset_id"], r)
     existing_asset_ids = set(existing_refs_by_id.keys())
 
-    # Determine new asset_ids (need face assignment, deduplicated)
+    # Determine new asset_ids (need face assignment, deduplicated) and keep
+    # the bbox selected by the user for each new asset.
     seen_aids: set[str] = set()
-    new_asset_ids: list[str] = []
+    new_assets: list[tuple[str, Optional[list[float]]]] = []
     for cr in crop_refs:
         if cr.asset_id not in existing_asset_ids and cr.asset_id not in seen_aids:
             seen_aids.add(cr.asset_id)
-            new_asset_ids.append(cr.asset_id)
+            new_assets.append((cr.asset_id, cr.bbox))
 
-    log.info(f"Saving {len(crop_refs)} refs for pet '{name}' ({len(new_asset_ids)} new assets)")
+    log.info(f"Saving {len(crop_refs)} refs for pet '{name}' ({len(new_assets)} new assets)")
 
-    ok = fail = skipped = 0
+    ok = fail = skipped = skipped_no_bbox = 0
     new_face_ids: dict[str, str] = {}
 
-    if person_id and new_asset_ids:
+    if person_id and new_assets:
         async with httpx.AsyncClient(timeout=30) as client:
-            for aid in new_asset_ids:
+            for aid, bbox in new_assets:
                 existing_persons = await imm.get_existing_face_person_ids(client, aid)
                 if person_id in existing_persons:
                     skipped += 1
                     continue
-                face_id = await imm.post_face(client, aid, person_id)
+                if not bbox or len(bbox) != 4:
+                    skipped_no_bbox += 1
+                    continue
+                face_id = await imm.post_face(
+                    client,
+                    aid,
+                    person_id,
+                    bbox_norm=bbox,
+                    source="set_pet_assets",
+                    context={"pet_name": name, "has_bbox": True},
+                )
                 if face_id:
                     new_face_ids[aid] = face_id
                     ok += 1
                 else:
                     fail += 1
-        log.info(f"Face assignment for '{name}': {ok} ok, {fail} failed, {skipped} already present")
+        log.info(f"Face assignment for '{name}': {ok} ok, {fail} failed, {skipped} already present, {skipped_no_bbox} skipped (no bbox)")
     elif not person_id:
         log.warning(f"Pet '{name}' has no person_id, skipping face assignment")
 
@@ -482,7 +642,13 @@ async def set_pet_assets(name: str, body: PetCropAssets):
             "face_id": face_id,
         })
     data.save_pet_refs(folder_key, final_refs, DATA_DIR)
-    return {"ok": True, "count": len(final_refs), "faces_added": ok, "faces_failed": fail}
+    return {
+        "ok": True,
+        "count": len(final_refs),
+        "faces_added": ok,
+        "faces_failed": fail,
+        "faces_skipped_no_bbox": skipped_no_bbox,
+    }
 
 
 @router.delete("/pets/{name}/assets/{asset_id}")
@@ -524,7 +690,17 @@ def _classifier_fingerprint(pet_names: list[str], refs_per_pet: dict, negative_i
     """Stable hash of the inputs that define a trained classifier."""
     parts = []
     for name in sorted(pet_names):
-        parts.append(name + ":" + ",".join(sorted(r["asset_id"] for r in refs_per_pet[name])))
+        ref_parts = []
+        for r in refs_per_pet[name]:
+            aid = r.get("asset_id", "")
+            cidx = r.get("crop_idx")
+            bbox = r.get("bbox")
+            bbox_key = ""
+            if isinstance(bbox, list):
+                # Normalize float formatting for stable hashes across JSON writes.
+                bbox_key = ",".join(f"{float(v):.6f}" for v in bbox)
+            ref_parts.append(f"{aid}|{cidx}|{bbox_key}")
+        parts.append(name + ":" + ",".join(sorted(ref_parts)))
     parts.append("neg:" + ",".join(sorted(negative_ids)))
     return hashlib.md5("\n".join(parts).encode()).hexdigest()
 
@@ -572,7 +748,9 @@ async def get_suggestions(name: str, limit: int = 20):
     ref_ids = data.load_pet_asset_ids(pet_cfg.get("person_id") or name, DATA_DIR)
     ref_set = set(ref_ids)
     neg_ids = set(data.load_negative_ids(DATA_DIR))
-    exclude = ref_set | neg_ids
+    skipped_ids = set(data.load_skipped_ids(DATA_DIR, name))
+    skip_as_ref_ids = set(data.load_skip_as_ref_ids(DATA_DIR, name))
+    exclude = ref_set | neg_ids | skipped_ids | skip_as_ref_ids
 
     async with httpx.AsyncClient(timeout=30) as client:
         if ref_ids:
@@ -593,7 +771,32 @@ async def get_suggestions(name: str, limit: int = 20):
         return {"assets": []}
 
     if not ref_ids:
-        return {"assets": [_slim_asset(a) for a in candidates[:limit]]}
+        # Even without refs, attach detected crops so Find References can show
+        # and inspect candidate bboxes the same way as scan/discover flows.
+        seed_candidates = candidates[:limit]
+
+        def detect_only():
+            indexed: list[tuple[int, dict]] = []
+            with ThreadPoolExecutor(max_workers=emb.SCAN_WORKERS) as ex:
+                futures = {ex.submit(emb.get_crops_and_embed, a["id"]): (idx, a) for idx, a in enumerate(seed_candidates)}
+                for future in as_completed(futures):
+                    idx, a = futures[future]
+                    crops = []
+                    for c, _ in (future.result() or []):
+                        if c is not None:
+                            crops.append(c)
+                    indexed.append((idx, {**_slim_asset(a), "crops": crops}))
+            indexed.sort(key=lambda x: x[0])
+            return [item for _, item in indexed]
+
+        async def build_seed_response():
+            try:
+                results = await asyncio.wait_for(asyncio.to_thread(detect_only), timeout=LONG_REQUEST_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail=f"Timed out after {LONG_REQUEST_TIMEOUT}s")
+            return {"assets": results}
+
+        return await _streaming_json(build_seed_response())
 
     def compute():
         result = _build_classifier_from_config(config)
@@ -640,8 +843,9 @@ async def get_borderline(name: str, limit: int = 40):
 
     ref_set = set(ref_ids)
     neg_ids = set(data.load_negative_ids(DATA_DIR))
-    skipped_ids = set(data.load_skipped_ids(DATA_DIR))
-    exclude = ref_set | neg_ids | skipped_ids
+    skipped_ids = set(data.load_skipped_ids(DATA_DIR, name))
+    skip_as_ref_ids = set(data.load_skip_as_ref_ids(DATA_DIR, name))
+    exclude = ref_set | neg_ids | skipped_ids | skip_as_ref_ids
 
     async with httpx.AsyncClient(timeout=30) as client:
         candidates = await _visual_search(client, ref_ids, pet_cfg, exclude)
@@ -890,16 +1094,33 @@ async def set_timestamp(body: TimestampBody):
 
 class ScanRequest(BaseModel):
     scan_until: Optional[str] = None
+    discover_only: bool = False
+    pet_name: Optional[str] = None
+
+
+class ScanTagRequest(BaseModel):
+    asset_ids: Optional[list[str]] = None
+    pet_name: Optional[str] = None
+    use_match: bool = False
+    bboxes: Optional[dict[str, Optional[list[float]]]] = None
 
 
 @router.post("/scan")
 async def trigger_scan(body: ScanRequest = ScanRequest()):
     _require_inference()
     import state
+    config = data.load_config(DATA_DIR)
+    pet_name = body.pet_name.strip() if body.pet_name else None
+    if pet_name:
+        if pet_name not in config:
+            raise HTTPException(status_code=404, detail=f"Pet '{pet_name}' not found")
+        ref_count = len(data.load_pet_refs(config[pet_name].get("person_id") or pet_name, DATA_DIR))
+        if ref_count == 0:
+            raise HTTPException(status_code=400, detail=f"Pet '{pet_name}' has no references to scan against")
     if state.scan_lock is not None and state.scan_lock.locked():
         state.scan_cancel.set()
     state.scan_generation += 1
-    asyncio.create_task(_run_manual_scan(state.scan_generation, body.scan_until))
+    asyncio.create_task(_run_manual_scan(state.scan_generation, body.scan_until, body.discover_only, pet_name))
     return {"status": "started"}
 
 
@@ -913,11 +1134,11 @@ async def stop_scan():
     return {"status": "stopped"}
 
 
-async def _run_manual_scan(generation: int, scan_until: str | None = None):
+async def _run_manual_scan(generation: int, scan_until: str | None = None, discover_only: bool = False, pet_name: str | None = None):
     import state
     from poller import run_poll_cycle
     live_counts: dict = {}
-    state.manual_scan_result = {"status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "counts": live_counts}
+    state.manual_scan_result = {"status": "running", "started_at": datetime.now(timezone.utc).isoformat(), "counts": live_counts, "pet_name": pet_name, "scan_until": scan_until, "discover_only": discover_only}
     state.scan_low_conf_assets = []
     low_conf_assets: list = []
 
@@ -930,13 +1151,16 @@ async def _run_manual_scan(generation: int, scan_until: str | None = None):
             if state.scan_generation != generation:
                 return
             state.scan_cancel.clear()
-            await asyncio.to_thread(run_poll_cycle, DATA_DIR, on_date, state.scan_cancel, low_conf_assets, live_counts, True, scan_until)
+            await asyncio.to_thread(run_poll_cycle, DATA_DIR, on_date, state.scan_cancel, low_conf_assets, live_counts, True, scan_until, discover_only, pet_name)
             if state.scan_generation == generation:
                 state.scan_low_conf_assets = low_conf_assets
-                state.manual_scan_result = data.load_poll_status(DATA_DIR)
+                result = data.load_poll_status(DATA_DIR)
+                if isinstance(result, dict):
+                    result.update({"pet_name": pet_name, "scan_until": scan_until, "discover_only": discover_only})
+                state.manual_scan_result = result
     except Exception as e:
         if state.scan_generation == generation:
-            state.manual_scan_result = {"status": "error", "error": str(e), "ran_at": datetime.now(timezone.utc).isoformat()}
+            state.manual_scan_result = {"status": "error", "error": str(e), "ran_at": datetime.now(timezone.utc).isoformat(), "pet_name": pet_name, "scan_until": scan_until, "discover_only": discover_only}
 
 
 @router.get("/scan/result")
@@ -944,8 +1168,22 @@ async def get_scan_result():
     result = state.manual_scan_result
     if not result:
         return {"status": "none"}
-    skipped = set(data.load_skipped_ids(DATA_DIR)) | set(data.load_negative_ids(DATA_DIR))
-    filtered_count = len({a["asset_id"] for a in (state.scan_low_conf_assets or []) if a["asset_id"] not in skipped})
+    negative_ids = set(data.load_negative_ids(DATA_DIR))
+    low_conf_assets = state.scan_low_conf_assets or []
+    skipped_by_pet: dict[str, set[str]] = {}
+
+    def is_skipped_for_pet(asset: dict) -> bool:
+        aid = asset.get("asset_id")
+        if aid in negative_ids:
+            return True
+        pet_name = asset.get("pet_name")
+        if not isinstance(pet_name, str):
+            return False
+        if pet_name not in skipped_by_pet:
+            skipped_by_pet[pet_name] = set(data.load_skipped_ids(DATA_DIR, pet_name))
+        return aid in skipped_by_pet[pet_name]
+
+    filtered_count = len({a["asset_id"] for a in low_conf_assets if not is_skipped_for_pet(a)})
     counts = {**result.get("counts", {}), "low_confidence": filtered_count}
     return {**result, "counts": counts}
 
@@ -954,23 +1192,160 @@ async def get_scan_result():
 async def get_scan_low_confidence():
     from poller import THRESHOLD
     config = data.load_config(DATA_DIR)
-    skipped = set(data.load_skipped_ids(DATA_DIR)) | set(data.load_negative_ids(DATA_DIR))
+    negative_ids = set(data.load_negative_ids(DATA_DIR))
+    skipped_by_pet: dict[str, set[str]] = {}
     seen: dict = {}
     for a in (state.scan_low_conf_assets or []):
         aid = a["asset_id"]
-        if aid in skipped:
+        if aid in negative_ids:
             continue
+        pet_name = a.get("pet_name")
+        if isinstance(pet_name, str):
+            if pet_name not in skipped_by_pet:
+                skipped_by_pet[pet_name] = set(data.load_skipped_ids(DATA_DIR, pet_name))
+            if aid in skipped_by_pet[pet_name]:
+                continue
         if aid not in seen or a["prob"] > seen[aid]["prob"]:
             seen[aid] = a
     sorted_assets = sorted(seen.values(), key=lambda a: a["prob"])
     return {
         "assets": [
             {"id": a["asset_id"], "thumb": f"/api/crop/{a['asset_id']}",
-             "pet_name": a["pet_name"], "score": a["prob"], "date": a.get("date", "")}
+             "pet_name": a["pet_name"], "score": a["prob"], "date": a.get("date", ""), "bbox": a.get("bbox")}
             for a in sorted_assets
         ],
         "pets": list(config.keys()),
         "threshold": THRESHOLD,
+    }
+
+
+@router.post("/scan/tag")
+async def tag_scan_assets(body: ScanTagRequest):
+    config = data.load_config(DATA_DIR)
+    person_by_pet = {name: cfg.get("person_id") for name, cfg in config.items() if cfg.get("person_id")}
+    negative_ids = set(data.load_negative_ids(DATA_DIR))
+
+    targets: list[tuple[str, str, Optional[list[float]]]] = []
+    skipped_no_match = 0
+    skipped_no_person = 0
+    skipped_no_bbox = 0
+    skipped_ignored = 0
+
+    if body.use_match:
+        result = state.manual_scan_result if isinstance(state.manual_scan_result, dict) else {}
+        matched_assets = result.get("matched_assets") or []
+        selected_ids = set(body.asset_ids or [])
+        candidates = []
+        for a in matched_assets:
+            aid = str(a.get("asset_id") or "")
+            pet_name = str(a.get("pet_name") or "")
+            if not aid or not pet_name:
+                continue
+            if selected_ids and aid not in selected_ids:
+                continue
+            candidates.append({"asset_id": aid, "pet_name": pet_name, "bbox": a.get("bbox")})
+
+        if body.asset_ids and not candidates:
+            skipped_no_match += len(body.asset_ids)
+
+        seen_targets: set[tuple[str, str]] = set()
+        ignored_by_pet: dict[str, set[str]] = {}
+        for matched in candidates:
+            aid = matched["asset_id"]
+            if aid in negative_ids:
+                continue
+            pet_name = matched.get("pet_name")
+            if isinstance(pet_name, str):
+                if pet_name not in ignored_by_pet:
+                    ignored_by_pet[pet_name] = set(data.load_skipped_ids(DATA_DIR, pet_name))
+                if aid in ignored_by_pet[pet_name]:
+                    skipped_ignored += 1
+                    continue
+            person_id = person_by_pet.get(pet_name)
+            if not person_id:
+                skipped_no_person += 1
+                continue
+            dedup_key = (aid, person_id)
+            if dedup_key in seen_targets:
+                continue
+            seen_targets.add(dedup_key)
+            bbox_override_present = body.bboxes is not None and aid in body.bboxes
+            bbox_norm = body.bboxes.get(aid) if bbox_override_present else matched.get("bbox")
+            if not bbox_norm or len(bbox_norm) != 4:
+                skipped_no_bbox += 1
+                continue
+            targets.append((aid, person_id, bbox_norm))
+    else:
+        if not body.pet_name:
+            raise HTTPException(status_code=400, detail="pet_name is required unless use_match=true")
+        person_id = person_by_pet.get(body.pet_name)
+        if not person_id:
+            raise HTTPException(status_code=404, detail=f"Pet '{body.pet_name}' has no person_id configured")
+        ids = body.asset_ids or []
+        if not ids:
+            raise HTTPException(status_code=400, detail="asset_ids is required when use_match=false")
+        ignored_ids = set(data.load_skipped_ids(DATA_DIR, body.pet_name))
+        for aid in ids:
+            if aid in negative_ids:
+                continue
+            if aid in ignored_ids:
+                skipped_ignored += 1
+                continue
+            bbox_override_present = body.bboxes is not None and aid in body.bboxes
+            bbox_norm = body.bboxes.get(aid) if bbox_override_present else None
+            if not bbox_norm or len(bbox_norm) != 4:
+                skipped_no_bbox += 1
+                continue
+            targets.append((aid, person_id, bbox_norm))
+
+    if not targets:
+        return {
+            "requested": len(body.asset_ids or []),
+            "processed": 0,
+            "tagged": 0,
+            "already_tagged": 0,
+            "failed": 0,
+            "skipped_no_match": skipped_no_match,
+            "skipped_no_person": skipped_no_person,
+            "skipped_no_bbox": skipped_no_bbox,
+            "skipped_ignored": skipped_ignored,
+        }
+
+    tagged = 0
+    already_tagged = 0
+    failed = 0
+    async with httpx.AsyncClient(timeout=30) as client:
+        for aid, person_id, bbox_norm in targets:
+            try:
+                existing = await imm.get_existing_face_person_ids(client, aid)
+                if person_id in existing:
+                    already_tagged += 1
+                    continue
+                face_id = await imm.post_face(
+                    client,
+                    aid,
+                    person_id,
+                    bbox_norm=bbox_norm,
+                    source="scan_tag",
+                    context={"use_match": bool(body.use_match), "has_bbox_override": bbox_norm is not None},
+                )
+                if face_id:
+                    tagged += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+
+    return {
+        "requested": len(body.asset_ids or targets),
+        "processed": len(targets),
+        "tagged": tagged,
+        "already_tagged": already_tagged,
+        "failed": failed,
+        "skipped_no_match": skipped_no_match,
+        "skipped_no_person": skipped_no_person,
+        "skipped_no_bbox": skipped_no_bbox,
+        "skipped_ignored": skipped_ignored,
     }
 
 
@@ -1024,6 +1399,24 @@ async def get_asset_crops(asset_id: str):
 async def thumbnail(asset_id: str):
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(f"{imm.IMMICH_URL}/api/assets/{asset_id}/thumbnail?size=preview", headers=imm.headers())
+    return StreamingResponse(resp.aiter_bytes(), media_type=resp.headers.get("content-type", "image/jpeg"))
+
+
+@router.get("/asset-full/{asset_id}")
+async def asset_full(asset_id: str):
+    """Proxy a browser-safe preview for in-app inspection views.
+
+    Some originals (for example HEIC) are not consistently decodable by all
+    browsers when loaded directly as <img>. Using Immich preview bytes keeps
+    inspect rendering reliable while preserving enough detail for bbox review.
+    """
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(
+            f"{imm.IMMICH_URL}/api/assets/{asset_id}/thumbnail?size=preview",
+            headers=imm.headers(),
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="Failed to load full asset")
     return StreamingResponse(resp.aiter_bytes(), media_type=resp.headers.get("content-type", "image/jpeg"))
 
 

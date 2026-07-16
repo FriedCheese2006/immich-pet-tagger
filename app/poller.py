@@ -76,7 +76,12 @@ def migrate_ref_bboxes(data_dir: Path) -> None:
                     changed = True
                     face_recovered += 1
         if changed:
-            data.save_pet_refs(folder_key, refs, data_dir)
+            try:
+                data.save_pet_refs(folder_key, refs, data_dir)
+            except PermissionError as e:
+                # Keep startup running even if legacy docker-written files are not writable
+                # in local script mode. Users can fix ownership and restart to complete migration.
+                log.warning(f"Skipping ref migration write for '{folder_key}': {e}")
     parts = []
     if bbox_resolved or bbox_unresolvable:
         parts.append(f"bbox: {bbox_resolved} resolved, {bbox_unresolvable} unresolvable")
@@ -90,32 +95,44 @@ def migrate_ref_bboxes(data_dir: Path) -> None:
 # Main poll cycle
 # ---------------------------------------------------------------------------
 
-def run_poll_cycle(data_dir: str, on_date=None, cancel=None, low_conf_out=None, live_counts: dict | None = None, manual: bool = False, scan_until: str | None = None) -> None:
+def run_poll_cycle(data_dir: str, on_date=None, cancel=None, low_conf_out=None, live_counts: dict | None = None, manual: bool = False, scan_until: str | None = None, discover_only: bool = False, pet_name: str | None = None) -> None:
     log.info(f"Poll cycle | threshold={THRESHOLD} manual={manual}")
     dd = Path(data_dir)
     now = datetime.now(timezone.utc).isoformat()
     data.write_poll_status(dd, {"status": "running", "started_at": now})
 
     counts = live_counts if live_counts is not None else {}
-    for k in ("added", "low_confidence", "unknown", "out_of_range", "already_tagged", "failed", "no_thumb"):
+    for k in ("added", "low_confidence", "unknown", "out_of_range", "already_tagged", "failed", "no_thumb", "matched"):
         counts[k] = 0
     try:
-        _run_poll_cycle(dd, counts, on_date, cancel, low_conf_out, manual, scan_until)
+        extra = _run_poll_cycle(dd, counts, on_date, cancel, low_conf_out, manual, scan_until, discover_only, pet_name)
     except Exception as e:
         data.write_poll_status(dd, {"status": "error", "ran_at": datetime.now(timezone.utc).isoformat(), "error": str(e), "counts": counts})
         raise
     else:
-        data.write_poll_status(dd, {"status": "idle", "ran_at": datetime.now(timezone.utc).isoformat(), "counts": counts})
+        status = {"status": "idle", "ran_at": datetime.now(timezone.utc).isoformat(), "counts": counts}
+        if isinstance(extra, dict):
+            status.update(extra)
+        data.write_poll_status(dd, status)
 
 
-def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_out=None, manual: bool = False, scan_until: str | None = None) -> None:
+def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_out=None, manual: bool = False, scan_until: str | None = None, discover_only: bool = False, pet_name: str | None = None) -> dict:
     config = data.load_config(dd)
     if not config:
         log.warning("config.json empty or missing, no pets configured yet.")
-        return
+        return {}
+
+    if pet_name and pet_name not in config:
+        log.warning(f"Requested scan pet '{pet_name}' not found in config.")
+        return {}
 
     all_pet_names = list(config.keys())
+
     all_refs = {name: data.load_pet_refs(config[name].get("person_id") or name, dd) for name in all_pet_names}
+    ref_asset_ids_by_pet = {
+        name: {str(r.get("asset_id")) for r in refs if r.get("asset_id")}
+        for name, refs in all_refs.items()
+    }
 
     pet_names = [n for n in all_pet_names if all_refs.get(n)]
     refs_per_pet = {n: all_refs[n] for n in pet_names}
@@ -125,7 +142,7 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
         log.warning(f"Skipping pets with no refs: {skipped}")
     if not pet_names:
         log.warning("No pets with reference assets, enroll pets via the UI first.")
-        return
+        return {}
 
     log.info(f"Pets: {', '.join(f'{n}({len(refs_per_pet[n])} refs)' for n in pet_names)}")
 
@@ -135,27 +152,27 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
 
     result = clf_mod.build_classifier(pet_names, refs_per_pet, negative_ids)
     if result is None:
-        return
+        return {}
     names, clf, scaler = result
 
     last_ts = data.load_last_timestamp(dd)
-    log.info(f"Fetching assets taken after: {last_ts}")
+    log.info(f"Fetching assets by taken date (fileCreatedAt/localDateTime) after: {last_ts}")
 
     t0 = time.time()
-    if manual:
-        taken_before = (scan_until + "T23:59:59.999Z") if scan_until else None
-        assets = imm.fetch_assets_taken_after(last_ts, taken_before)
-    else:
-        assets = imm.fetch_assets_created_after(last_ts)
+    taken_before = (scan_until + "T23:59:59.999Z") if manual and scan_until else None
+    assets = imm.fetch_assets_taken_after(last_ts, taken_before)
     log.info(f"Fetched {len(assets)} assets in {time.time()-t0:.1f}s")
 
     if not assets:
         log.info("No new assets.")
         if not manual:
             data.save_last_timestamp(datetime.now(timezone.utc).isoformat(), dd)
-        return
+        return {}
 
     latest_ts = max((ts for _, ts in assets), default=last_ts)
+    matched_assets: list[dict] = []
+    low_conf_assets: list[dict] = []
+    matched_lock = threading.Lock()
 
     def process_asset(aid: str, time_str: str) -> None:
         if cancel and cancel.is_set():
@@ -183,28 +200,110 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
         # stored; an empty list marks "no animal detected".
         emb.store_crops(aid, [(b, v) for b, v in vecs if b is not None and v is not None])
 
-        existing_persons: set | None = None
-        tagged_in_photo: set[str] = set()
+        if discover_only:
+            best_match_by_pet: dict[str, dict] = {}
+            best_low_by_pet: dict[str, dict] = {}
+            for bbox_norm, vec in vecs:
+                if vec is None:
+                    continue
+
+                predicted_pet, prob = clf_mod.classify(vec, names, clf, scaler)
+
+                if predicted_pet == "unknown":
+                    with _count_lock:
+                        counts["unknown"] += 1
+                    continue
+
+                if pet_name and predicted_pet != pet_name:
+                    continue
+
+                cfg = config.get(predicted_pet, {})
+                if not asset_in_range(time_str, cfg.get("since"), cfg.get("until")):
+                    with _count_lock:
+                        counts["out_of_range"] += 1
+                    continue
+
+                if prob < THRESHOLD:
+                    prev_low = best_low_by_pet.get(predicted_pet)
+                    if prev_low is None or prob > prev_low["prob"]:
+                        best_low_by_pet[predicted_pet] = {
+                            "asset_id": aid,
+                            "date": time_str[:10],
+                            "pet_name": predicted_pet,
+                            "prob": round(float(prob), 4),
+                            "bbox": list(bbox_norm) if bbox_norm is not None else None,
+                        }
+                    continue
+
+                prev_match = best_match_by_pet.get(predicted_pet)
+                if prev_match is None or prob > prev_match["prob"]:
+                    best_match_by_pet[predicted_pet] = {
+                        "asset_id": aid,
+                        "date": time_str[:10],
+                        "pet_name": predicted_pet,
+                        "prob": round(float(prob), 4),
+                        "bbox": list(bbox_norm) if bbox_norm is not None else None,
+                    }
+
+            if best_match_by_pet or best_low_by_pet:
+                existing_face_person_ids = imm.fetch_asset_face_person_ids(aid)
+            else:
+                existing_face_person_ids = set()
+
+            all_pets = set(best_match_by_pet.keys()) | set(best_low_by_pet.keys())
+            for pet in all_pets:
+                chosen = best_match_by_pet.get(pet) or best_low_by_pet.get(pet)
+                if not chosen:
+                    continue
+
+                chosen_cfg = config.get(pet, {})
+                chosen_person_id = chosen_cfg.get("person_id")
+                chosen["is_reference"] = aid in ref_asset_ids_by_pet.get(pet, set())
+                if chosen_person_id:
+                    chosen["already_tagged"] = chosen_person_id in existing_face_person_ids
+                else:
+                    chosen["already_tagged"] = False
+
+                if pet in best_match_by_pet:
+                    with matched_lock:
+                        matched_assets.append(chosen)
+                    with _count_lock:
+                        counts["matched"] += 1
+                else:
+                    with matched_lock:
+                        low_conf_assets.append(chosen)
+                    with _count_lock:
+                        counts["low_confidence"] += 1
+            return
 
         for bbox_norm, vec in vecs:
             if vec is None:
                 continue
 
-            pet_name, prob = clf_mod.classify(vec, names, clf, scaler)
+            predicted_pet, prob = clf_mod.classify(vec, names, clf, scaler)
 
-            if pet_name == "unknown":
+            if predicted_pet == "unknown":
                 with _count_lock:
                     counts["unknown"] += 1
+                continue
+
+            if pet_name and predicted_pet != pet_name:
                 continue
 
             if prob < THRESHOLD:
                 with _count_lock:
                     counts["low_confidence"] += 1
                 if low_conf_out is not None:
-                    low_conf_out.append({"asset_id": aid, "pet_name": pet_name, "prob": prob, "date": time_str[:10]})
+                        low_conf_out.append({
+                            "asset_id": aid,
+                            "pet_name": predicted_pet,
+                            "prob": prob,
+                            "date": time_str[:10],
+                            "bbox": list(bbox_norm) if bbox_norm is not None else None,
+                        })
                 continue
 
-            cfg = config.get(pet_name, {})
+            cfg = config.get(predicted_pet, {})
             if not asset_in_range(time_str, cfg.get("since"), cfg.get("until")):
                 with _count_lock:
                     counts["out_of_range"] += 1
@@ -212,31 +311,22 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
 
             person_id = cfg.get("person_id")
             if not person_id:
-                log.warning(f"Pet '{pet_name}' has no person_id in config.")
+                log.warning(f"Pet '{predicted_pet}' has no person_id in config.")
                 continue
 
-            if person_id in tagged_in_photo:
-                with _count_lock:
-                    counts["already_tagged"] += 1
-                continue
-
-            if existing_persons is None:
-                existing_persons = imm.fetch_asset_face_person_ids(aid)
-
-            if person_id in existing_persons:
-                with _count_lock:
-                    counts["already_tagged"] += 1
-                continue
-
-            log.info(f"{imm.IMMICH_URL}/search/photos/{aid} -> {pet_name} ({prob:.3f}) | {time_str[:10]}")
-
-            face_id = imm.post_face_sync(aid, person_id, bbox_norm, img.size if bbox_norm is not None else None)
-            tagged_in_photo.add(person_id)
+            # Auto poll/scan cycles are discovery only. Face assignment to
+            # Immich is user-initiated via explicit tag actions in the UI.
+            log.info(f"Discover match {aid} -> {predicted_pet} ({prob:.3f}) | {time_str[:10]}")
+            with matched_lock:
+                matched_assets.append({
+                    "asset_id": aid,
+                    "date": time_str[:10],
+                    "pet_name": predicted_pet,
+                    "prob": round(float(prob), 4),
+                    "bbox": list(bbox_norm) if bbox_norm is not None else None,
+                })
             with _count_lock:
-                if face_id:
-                    counts["added"] += 1
-                else:
-                    counts["failed"] += 1
+                counts["matched"] += 1
 
     import detector as _det
     emb.reset_batch_stats()
@@ -251,7 +341,7 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
             if cancel and cancel.is_set():
                 executor.shutdown(wait=False, cancel_futures=True)
                 log.info("Scan cancelled.")
-                return
+                return {}
             try:
                 future.result()
             except Exception as e:
@@ -270,6 +360,33 @@ def _run_poll_cycle(dd: Path, counts: dict, on_date=None, cancel=None, low_conf_
 
     emb.save_embed_cache()
 
+    if discover_only:
+        matched_assets.sort(key=lambda a: (a["date"], -a["prob"], a["asset_id"]))
+        low_conf_assets.sort(key=lambda a: (a["date"], -a["prob"], a["asset_id"]))
+        log.info(
+            f"Discover-only scan complete. matched={len(matched_assets)} low_conf={len(low_conf_assets)} in_scope={len(assets)}"
+        )
+        return {
+            "discover_only": True,
+            "in_scope_total": len(assets),
+            "matched_total": len(matched_assets),
+            "matched_assets": matched_assets,
+            "low_conf_total": len(low_conf_assets),
+            "low_conf_assets": low_conf_assets,
+            "threshold": THRESHOLD,
+        }
+
     if not manual:
         data.save_last_timestamp(latest_ts, dd)
         log.info(f"Saved timestamp: {latest_ts}")
+    if manual:
+        matched_assets.sort(key=lambda a: (a["date"], -a["prob"], a["asset_id"]))
+        return {
+            "discover_only": False,
+            "matched_total": len(matched_assets),
+            "matched_assets": matched_assets,
+            "low_conf_total": len(low_conf_assets),
+            "low_conf_assets": low_conf_assets,
+            "threshold": THRESHOLD,
+        }
+    return {}

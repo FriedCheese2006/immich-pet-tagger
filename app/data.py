@@ -96,20 +96,146 @@ def save_negative_ids(ids: list[str], data_dir: Path) -> None:
 # Skipped
 # ---------------------------------------------------------------------------
 
-def load_skipped_ids(data_dir: Path) -> list[str]:
+def _load_skipped_map(data_dir: Path) -> dict[str, list[str]]:
+    """Return pet_name -> skipped asset IDs.
+
+    Backwards compatibility:
+    - legacy list format becomes {"__legacy_global__": [...]}.
+    - malformed payloads return {}.
+    """
     path = data_dir / "skipped.json"
     if not path.exists():
-        return []
+        return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         log.error(f"Corrupted {path}, returning empty skipped list: {e}")
-        return []
+        return {}
+
+    if isinstance(raw, list):
+        return {"__legacy_global__": [str(x) for x in raw if isinstance(x, str)]}
+    if isinstance(raw, dict):
+        out: dict[str, list[str]] = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not isinstance(v, list):
+                continue
+            out[k] = [str(x) for x in v if isinstance(x, str)]
+        return out
+    return {}
 
 
-def save_skipped_ids(ids: list[str], data_dir: Path) -> None:
+def load_skipped_ids(data_dir: Path, pet_name: str | None = None) -> list[str]:
+    skipped_map = _load_skipped_map(data_dir)
+
+    # Legacy global entries are applied to all pets until they are manually cleaned up.
+    legacy_global = skipped_map.get("__legacy_global__", [])
+    if pet_name is not None:
+        combined = legacy_global + skipped_map.get(pet_name, [])
+    else:
+        combined = []
+        for ids in skipped_map.values():
+            combined.extend(ids)
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for aid in combined:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        result.append(aid)
+    return result
+
+
+def save_skipped_ids(ids: list[str], data_dir: Path, pet_name: str | None = None) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write(data_dir / "skipped.json", json.dumps(ids, indent=2))
+    if pet_name is None:
+        _atomic_write(data_dir / "skipped.json", json.dumps(ids, indent=2))
+        return
+
+    skipped_map = _load_skipped_map(data_dir)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for aid in ids:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        deduped.append(aid)
+
+    skipped_map[pet_name] = deduped
+    _atomic_write(data_dir / "skipped.json", json.dumps(skipped_map, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Skip-as-reference
+# ---------------------------------------------------------------------------
+
+def _load_skip_as_ref_map(data_dir: Path) -> dict[str, list[str]]:
+    """Return pet_name -> skip-as-reference asset IDs.
+
+    Backwards compatibility:
+    - legacy list format becomes {"__legacy_global__": [...]}.
+    - malformed payloads return {}.
+    """
+    path = data_dir / "skip_as_ref.json"
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.error(f"Corrupted {path}, returning empty skip-as-reference list: {e}")
+        return {}
+
+    if isinstance(raw, list):
+        return {"__legacy_global__": [str(x) for x in raw if isinstance(x, str)]}
+    if isinstance(raw, dict):
+        out: dict[str, list[str]] = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not isinstance(v, list):
+                continue
+            out[k] = [str(x) for x in v if isinstance(x, str)]
+        return out
+    return {}
+
+
+def load_skip_as_ref_ids(data_dir: Path, pet_name: str | None = None) -> list[str]:
+    skip_map = _load_skip_as_ref_map(data_dir)
+
+    # Legacy global entries are applied to all pets until they are manually cleaned up.
+    legacy_global = skip_map.get("__legacy_global__", [])
+    if pet_name is not None:
+        combined = legacy_global + skip_map.get(pet_name, [])
+    else:
+        combined = []
+        for ids in skip_map.values():
+            combined.extend(ids)
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for aid in combined:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        result.append(aid)
+    return result
+
+
+def save_skip_as_ref_ids(ids: list[str], data_dir: Path, pet_name: str | None = None) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if pet_name is None:
+        _atomic_write(data_dir / "skip_as_ref.json", json.dumps(ids, indent=2))
+        return
+
+    skip_map = _load_skip_as_ref_map(data_dir)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for aid in ids:
+        if aid in seen:
+            continue
+        seen.add(aid)
+        deduped.append(aid)
+
+    skip_map[pet_name] = deduped
+    _atomic_write(data_dir / "skip_as_ref.json", json.dumps(skip_map, indent=2))
 
 
 # ---------------------------------------------------------------------------

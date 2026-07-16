@@ -100,3 +100,31 @@ def test_fetch_assets_keeps_all_when_owner_id_unknown(monkeypatch):
     monkeypatch.setattr(immich.requests, "post", lambda *a, **kw: _search_response(assets))
     result = immich._fetch_assets({"takenAfter": "2024-01-01"}, ts_field="fileCreatedAt", label="test")
     assert len(result) == 2
+
+
+def test_fetch_assets_taken_after_uses_taken_query(monkeypatch):
+    immich._owner_id = "owner-A"
+    payloads = []
+
+    def fake_post(url, json, headers, timeout):
+        payloads.append(json)
+        return _search_response([_make_asset("asset-1", "owner-A")])
+
+    monkeypatch.setattr(immich.requests, "post", fake_post)
+    result = immich.fetch_assets_taken_after("2024-01-01T00:00:00.000Z", "2024-01-02T23:59:59.999Z")
+    assert result == [("asset-1", "2024-01-01T00:00:00")]
+    assert payloads
+    assert payloads[0]["takenAfter"] == "2024-01-01T00:00:00.000Z"
+    assert payloads[0]["takenBefore"] == "2024-01-02T23:59:59.999Z"
+    assert "createdAfter" not in payloads[0]
+
+
+def test_fetch_assets_does_not_fallback_to_created_at(monkeypatch):
+    immich._owner_id = "owner-A"
+    assets = [
+        {"id": "asset-created-only", "ownerId": "owner-A", "createdAt": "2025-01-01T00:00:00"},
+        {"id": "asset-local", "ownerId": "owner-A", "localDateTime": "2021-10-30T03:37:46.000Z"},
+    ]
+    monkeypatch.setattr(immich.requests, "post", lambda *a, **kw: _search_response(assets))
+    result = immich._fetch_assets({"takenAfter": "2020-01-01"}, ts_field="fileCreatedAt", label="test")
+    assert result == [("asset-local", "2021-10-30T03:37:46.000Z")]

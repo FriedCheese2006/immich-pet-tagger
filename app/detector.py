@@ -1,4 +1,5 @@
-"""Animal detector using YOLOv8n. Batched inference via queue, N parallel worker threads.
+"""Animal detector using a configurable YOLO model. Batched inference via queue,
+N parallel worker threads.
 Pre-processing (PIL→tensor) happens in caller threads; batch threads only run the GPU kernel."""
 
 import logging
@@ -16,6 +17,9 @@ log = logging.getLogger("detector")
 YOLO_BATCH_SIZE = int(os.environ.get("YOLO_BATCH_SIZE", 32))
 YOLO_WORKERS = int(os.environ.get("GPU_WORKERS", 2))
 YOLO_INPUT_SIZE = int(os.environ.get("YOLO_INPUT_SIZE", 640))
+YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolo26s.pt")
+YOLO_DEDUP_IOU = float(os.environ.get("YOLO_DEDUP_IOU", 0.85))
+YOLO_DEDUP_IOA = float(os.environ.get("YOLO_DEDUP_IOA", 0.9))
 
 ANIMAL_CLASS_IDS = {
     14,  # bird
@@ -29,6 +33,65 @@ ANIMAL_CLASS_IDS = {
     22,  # zebra
     23,  # giraffe
 }
+
+
+def _bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = a_area + b_area - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def _bbox_area(box: tuple[float, float, float, float]) -> float:
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def _bbox_intersection_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    return max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+
+
+def _bbox_ioa_small(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    """Intersection over smaller box area.
+
+    This catches nested duplicate detections where IoU may be moderate but one
+    box mostly overlaps the other.
+    """
+    inter = _bbox_intersection_area(a, b)
+    if inter <= 0.0:
+        return 0.0
+    min_area = min(_bbox_area(a), _bbox_area(b))
+    return inter / min_area if min_area > 0.0 else 0.0
+
+
+def _dedupe_overlapping_boxes(
+    scored_boxes: list[tuple[float, tuple[float, float, float, float]]],
+    iou_threshold: float,
+    ioa_threshold: float,
+) -> list[tuple[float, float, float, float]]:
+    """Class-agnostic suppression to remove near-duplicate detections.
+
+    Ultralytics NMS is class-aware, so the same animal can appear twice if
+    classified under different animal classes. Keep the highest-confidence box.
+    """
+    kept: list[tuple[float, float, float, float]] = []
+    for _, box in scored_boxes:
+        if any((_bbox_iou(box, prev) >= iou_threshold) or (_bbox_ioa_small(box, prev) >= ioa_threshold) for prev in kept):
+            continue
+        kept.append(box)
+    return kept
 
 
 class _YoloReq:
@@ -61,13 +124,17 @@ def get_yolo_error() -> str | None:
     return _yolo_load_error
 
 
+def get_yolo_model() -> str:
+    return YOLO_MODEL
+
+
 def _yolo_batch_loop(worker_id: int) -> None:
     global yolo_batch_total, yolo_batch_count, _yolo_load_error
     from ultralytics import YOLO
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info(f"YOLO worker {worker_id} loading on {device}...")
+    log.info(f"YOLO worker {worker_id} loading model '{YOLO_MODEL}' on {device}...")
     try:
-        model = YOLO("yolov8n.pt")
+        model = YOLO(YOLO_MODEL)
         model.to(device)
     except Exception as e:
         _yolo_load_error = str(e)
@@ -75,7 +142,7 @@ def _yolo_batch_loop(worker_id: int) -> None:
             f"YOLO worker {worker_id} failed to load: {e}. "
             "On first start the model is downloaded (~6 MB). "
             "Ensure the container has internet access, then restart. "
-            "Alternatively, copy yolov8n.pt into the data volume manually."
+            f"Alternatively, copy {YOLO_MODEL} into the data volume manually."
         )
         return
     _yolo_worker_ready.set()
@@ -100,16 +167,16 @@ def _yolo_batch_loop(worker_id: int) -> None:
             stacked = torch.stack([req.tensor for req in batch])
             results_list = model(stacked, verbose=False, imgsz=YOLO_INPUT_SIZE)
             for req, result in zip(batch, results_list):
-                boxes = []
+                boxes: list[tuple[float, tuple[float, float, float, float]]] = []
                 for box in result.boxes:
                     cls = int(box.cls[0])
                     if cls not in ANIMAL_CLASS_IDS:
                         continue
                     conf = float(box.conf[0])
                     x1, y1, x2, y2 = box.xyxyn[0].tolist()
-                    boxes.append((conf, x1, y1, x2, y2))
-                boxes.sort(reverse=True)
-                req.result = [(x1, y1, x2, y2) for _, x1, y1, x2, y2 in boxes]
+                    boxes.append((conf, (x1, y1, x2, y2)))
+                boxes.sort(key=lambda x: x[0], reverse=True)
+                req.result = _dedupe_overlapping_boxes(boxes, YOLO_DEDUP_IOU, YOLO_DEDUP_IOA)
                 req.event.set()
         except Exception as e:
             log.warning(f"YOLO worker {worker_id} batch error: {e}")

@@ -103,6 +103,53 @@ def test_load_skipped_ids_corrupted(tmp_path):
     assert data.load_skipped_ids(tmp_path) == []
 
 
+def test_load_skipped_ids_per_pet(tmp_path):
+    data.save_skipped_ids(["a1", "a2"], tmp_path, "Rambo")
+    data.save_skipped_ids(["a2", "a3"], tmp_path, "Rose")
+
+    assert data.load_skipped_ids(tmp_path, "Rambo") == ["a1", "a2"]
+    assert data.load_skipped_ids(tmp_path, "Rose") == ["a2", "a3"]
+    assert set(data.load_skipped_ids(tmp_path)) == {"a1", "a2", "a3"}
+
+
+def test_load_skipped_ids_legacy_global_applies_to_pet(tmp_path):
+    (tmp_path / "skipped.json").write_text(json.dumps(["legacy1", "legacy2"]))
+    assert data.load_skipped_ids(tmp_path, "Rambo") == ["legacy1", "legacy2"]
+
+
+# ---------------------------------------------------------------------------
+# load_skip_as_ref_ids
+# ---------------------------------------------------------------------------
+
+def test_load_skip_as_ref_ids_missing(tmp_path):
+    assert data.load_skip_as_ref_ids(tmp_path) == []
+
+
+def test_load_skip_as_ref_ids_valid(tmp_path):
+    ids = ["s1", "s2"]
+    data.save_skip_as_ref_ids(ids, tmp_path)
+    assert data.load_skip_as_ref_ids(tmp_path) == ids
+
+
+def test_load_skip_as_ref_ids_corrupted(tmp_path):
+    (tmp_path / "skip_as_ref.json").write_text("[unclosed")
+    assert data.load_skip_as_ref_ids(tmp_path) == []
+
+
+def test_load_skip_as_ref_ids_per_pet(tmp_path):
+    data.save_skip_as_ref_ids(["a1", "a2"], tmp_path, "Rambo")
+    data.save_skip_as_ref_ids(["a2", "a3"], tmp_path, "Rose")
+
+    assert data.load_skip_as_ref_ids(tmp_path, "Rambo") == ["a1", "a2"]
+    assert data.load_skip_as_ref_ids(tmp_path, "Rose") == ["a2", "a3"]
+    assert set(data.load_skip_as_ref_ids(tmp_path)) == {"a1", "a2", "a3"}
+
+
+def test_load_skip_as_ref_ids_legacy_global_applies_to_pet(tmp_path):
+    (tmp_path / "skip_as_ref.json").write_text(json.dumps(["legacy1", "legacy2"]))
+    assert data.load_skip_as_ref_ids(tmp_path, "Rambo") == ["legacy1", "legacy2"]
+
+
 # ---------------------------------------------------------------------------
 # load_poll_status
 # ---------------------------------------------------------------------------

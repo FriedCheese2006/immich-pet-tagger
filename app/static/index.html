@@ -2,9 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Immich Pet Tagger</title>
-<link rel="stylesheet" href="/static/style.css?v=3">
+<link rel="stylesheet" href="/static/style.css?v=5">
 </head>
 <body>
 <div class="models-banner" id="modelsBanner"></div>
@@ -27,6 +30,7 @@
           <span>Until</span><input type="date" id="scanUntil">
         </div>
         <div class="scan-row">
+          <select id="scanPetSelect" class="action-select" style="flex:1; min-width:0;"></select>
           <button class="btn" style="font-size:11px; padding:5px 10px; flex:1;" onclick="applyTimestamp()">Scan</button>
           <button class="btn btn-danger" id="stopScanBtn" style="font-size:11px; padding:5px 10px; display:none;" onclick="stopScan()">Stop</button>
         </div>
@@ -42,16 +46,38 @@
           <div class="results-actions">
             <span id="selCount" style="font-size:12px; color:var(--text3);"></span>
             <button class="btn btn-primary" id="assignBtn" onclick="assignSelected()" style="display:none" title="Clear, close-up shot, your pet is the only subject.">Add to pet</button>
-            <button class="btn" id="skipBtn" onclick="skipSelected()" style="display:none" title="Blurry, distant, another person or animal visible alongside your pet, or a look-alike that is not yours. Ignored photos won't appear again.">Ignore</button>
+            <button class="btn btn-primary" id="discoverTagAllBtn" onclick="tagAllConfidentMatches()" style="display:none" title="Apply tags for all confident discovery matches.">Tag all confident</button>
+            <button class="btn" id="skipRefBtn" onclick="skipAsRefSelected()" style="display:none" title="Do not use these photos as references for this pet, but keep them eligible for tagging.">Skip as ref</button>
+            <button class="btn" id="skipBtn" onclick="skipSelected()" style="display:none" title="Exclude these photos for this pet from both references and tagging.">Ignore</button>
             <button class="btn btn-danger" id="addNegBtn" onclick="addSelectedAsNegatives()" style="display:none" title="Photos that could confuse the classifier. Empty rooms, other species, ambiguous shots. Around 50 is enough.">Not a pet</button>
             <div id="scanPetBtns" style="display:none; gap:4px; flex-wrap:wrap;"></div>
+            <div id="discoverPetGroup" class="discover-action-group" style="display:none;">
+              <select id="discoverPetSelect" class="action-select"></select>
+              <button class="btn" id="discoverTagPetBtn" onclick="tagSelectedAsChosenPet()">Tag pet</button>
+              <button class="btn" id="discoverRefPetBtn" onclick="tagAndRefSelectedChosenPet()">Tag pet + add ref</button>
+            </div>
           </div>
         </div>
         <div class="photo-grid" id="photoGrid"></div>
       </div>
       <div class="refs-panel">
         <div class="refs-header">
-          <span style="font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; color:var(--text3);" id="refsTitle">No pet selected</span>
+          <div style="display:flex; align-items:center; gap:6px; margin-right:8px;">
+            <span style="font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; color:var(--text3);" id="refsTitle">No pet selected</span>
+            <button class="icon-btn" id="viewSkippedBtn" onclick="openViewSkipped()" style="display:none;" title="View ignored photos for this pet">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+                <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+                <path d="M2 2L22 22" stroke="currentColor" stroke-width="2"/>
+              </svg>
+            </button>
+            <button class="icon-btn" id="viewSkipAsRefBtn" onclick="openViewSkipAsRef()" style="display:none;" title="View photos skipped as references for this pet">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M10 13a5 5 0 0 0 7.07 0l1.41-1.41a5 5 0 0 0 0-7.07 5 5 0 0 0-7.07 0L10 6"/>
+                <path d="M14 11a5 5 0 0 0-7.07 0l-1.41 1.41a5 5 0 0 0 0 7.07 5 5 0 0 0 7.07 0L14 18"/>
+                <path d="M3 3l18 18"/>
+              </svg>
+            </button>
+          </div>
           <div style="display:flex; gap:6px; align-items:center;">
             <button class="btn btn-primary" id="findRefsBtn" onclick="viewFindRefs()" style="display:none; font-size:12px; padding:5px 10px;">Find references</button>
             <button class="btn" id="addByIdBtn" onclick="openAddById()" style="display:none; font-size:12px; padding:5px 10px;">Add manually</button>
@@ -221,8 +247,62 @@
   </div>
 </div>
 
+<div class="modal-backdrop" id="inspectModal">
+  <div class="modal modal-inspect">
+    <div class="inspect-head">
+      <div class="inspect-head-title">
+        <h2>Detection Inspect</h2>
+        <div class="inspect-potential" id="inspectPotentialLabel">Potential: not available</div>
+      </div>
+      <div class="inspect-head-actions">
+        <a class="inspect-open-immich" id="inspectOpenImmich" href="#" target="_blank" rel="noopener" title="Open in Immich" aria-label="Open in Immich">
+          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
+            <path d="M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42 9.3-9.29H14V3z" fill="currentColor"></path>
+            <path d="M5 5h6v2H7v10h10v-4h2v6H5V5z" fill="currentColor"></path>
+          </svg>
+        </a>
+        <button class="btn" onclick="closeInspectModal()">Save</button>
+      </div>
+    </div>
+    <div class="inspect-body">
+      <div class="inspect-image-wrap">
+        <button class="inspect-nav-overlay inspect-nav-overlay-left" type="button" id="inspectPrevBtn" onclick="navigateInspect(-1)" aria-label="Previous result" title="Previous result">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
+            <path d="M15.5 4.5L8 12l7.5 7.5-1.4 1.4L5.2 12l8.9-8.9z" fill="currentColor"></path>
+          </svg>
+        </button>
+        <button class="inspect-nav-overlay inspect-nav-overlay-right" type="button" id="inspectNextBtn" onclick="navigateInspect(1)" aria-label="Next result" title="Next result">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
+            <path d="M8.5 19.5L16 12 8.5 4.5l1.4-1.4 8.9 8.9-8.9 8.9z" fill="currentColor"></path>
+          </svg>
+        </button>
+        <img id="inspectImage" alt="Asset preview" draggable="false" src="" onerror="this.onerror=null; this.src='/api/thumb/' + (window.__inspectAssetId || '')">
+        <canvas id="inspectCanvas" class="inspect-canvas"></canvas>
+        <div class="inspect-bbox" id="inspectBbox" style="display:none;"></div>
+      </div>
+      <div class="inspect-meta" id="inspectMeta"></div>
+      <div class="inspect-controls">
+        <div class="inspect-controls-bottom">
+          <div class="inspect-controls-title">Actions</div>
+          <div class="inspect-controls-sub">Choose a pet and run tag / ignore / reference actions. If no bounding box is detected, the full image will be used.</div>
+          <select id="inspectPetSelect" class="action-select inspect-action-select"></select>
+          <div class="inspect-controls-actions inspect-actions-grid">
+            <button class="btn" type="button" onclick="inspectTagAsset()">Tag pet</button>
+            <button class="btn" type="button" onclick="inspectTagAndRefAsset()">Tag + ref</button>
+            <button class="btn" type="button" onclick="inspectAddRefAsset()">Add ref</button>
+            <button class="btn" type="button" onclick="inspectSkipAsRefAsset()">Skip as ref</button>
+            <button class="btn" type="button" onclick="inspectIgnoreAsset()">Ignore</button>
+            <button class="btn btn-danger" type="button" onclick="inspectNotPetAsset()">Not a pet</button>
+          </div>
+          <div class="inspect-controls-note" id="inspectActionStatus"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
-<script src="/static/app.js?v=3"></script>
+<script src="/static/app.js?v=20"></script>
 </body>
 </html>

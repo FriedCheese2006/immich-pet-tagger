@@ -26,6 +26,8 @@ SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", _default_scan_workers))
 CLIP_BATCH_SIZE = int(os.environ.get("CLIP_BATCH_SIZE", 32))
 CLIP_MODEL_NAME = "ViT-B-16"
 CLIP_PRETRAINED = "openai"
+CROP_DEDUP_IOU = float(os.environ.get("YOLO_DEDUP_IOU", 0.85))
+CROP_DEDUP_IOA = float(os.environ.get("YOLO_DEDUP_IOA", 0.9))
 
 MAX_EMBED_CACHE_SIZE = int(os.environ.get("EMBED_CACHE_SIZE", 5000))
 _embed_cache: OrderedDict[str, list[np.ndarray]] = OrderedDict()
@@ -40,6 +42,49 @@ _cache_lock = threading.Lock()
 # touches an asset (poller, borderline, suggestions). Backed by SQLite so it
 # grows on disk only with the assets we actually process, not the whole library.
 _crops_db: sqlite3.Connection | None = None
+
+
+def _bbox_iou(a: list[float], b: list[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    aa = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    ba = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = aa + ba - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def _bbox_ioa_small(a: list[float], b: list[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    aa = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    ba = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    min_area = min(aa, ba)
+    return inter / min_area if min_area > 0.0 else 0.0
+
+
+def _dedupe_crop_pairs(pairs: list[tuple[list, np.ndarray]]) -> list[tuple[list, np.ndarray]]:
+    if len(pairs) <= 1:
+        return pairs
+    kept: list[tuple[list, np.ndarray]] = []
+    kept_boxes: list[list[float]] = []
+    for bbox, vec in pairs:
+        if any((_bbox_iou(bbox, kb) >= CROP_DEDUP_IOU) or (_bbox_ioa_small(bbox, kb) >= CROP_DEDUP_IOA) for kb in kept_boxes):
+            continue
+        kept.append((bbox, vec))
+        kept_boxes.append(bbox)
+    return kept
 
 # ---------------------------------------------------------------------------
 # CLIP batch workers
@@ -241,7 +286,12 @@ def get_crops_and_embed(asset_id: str) -> list[tuple[dict, np.ndarray]]:
     Cached per asset in crops.db and reused across all pets and requests."""
     cached = _load_crops(asset_id)
     if cached is not None:
-        return _crops_to_result(cached)
+        deduped_cached = _dedupe_crop_pairs(cached)
+        if len(deduped_cached) != len(cached):
+            # Rewrite stale cache entries created before improved dedupe.
+            store_crops(asset_id, deduped_cached)
+            log.info(f"Dedupe cache refresh for {asset_id}: {len(cached)} -> {len(deduped_cached)} crops")
+        return _crops_to_result(deduped_cached)
     img = fetch_thumbnail(asset_id)
     if img is None:
         return []  # transient fetch failure, do not cache
@@ -250,6 +300,7 @@ def get_crops_and_embed(asset_id: str) -> list[tuple[dict, np.ndarray]]:
         vec = embed_image(crop_img)
         if vec is not None:
             pairs.append((list(bbox), vec))
+    pairs = _dedupe_crop_pairs(pairs)
     store_crops(asset_id, pairs)
     return _crops_to_result(pairs)
 

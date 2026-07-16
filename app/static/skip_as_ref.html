@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Skipped Reference Photos</title>
+<link rel="stylesheet" href="/static/style.css?v=5">
+<style>
+  body {
+    padding: 20px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 0.5px solid var(--border);
+  }
+  .header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0;
+  }
+  .header .count {
+    font-size: 14px;
+    color: var(--text3);
+    font-weight: 400;
+  }
+  .skipped-grid-page {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    grid-auto-rows: 180px;
+    gap: 12px;
+    align-content: start;
+  }
+  .skipped-thumb-page {
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    position: relative;
+    background: var(--bg3);
+    border: 0.5px solid var(--border);
+    transition: border-color 0.1s;
+  }
+  .skipped-thumb-page:hover {
+    border-color: var(--accent);
+  }
+  .skipped-thumb-page img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .skipped-remove-page {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.7);
+    border: none;
+    color: #fff;
+    font-size: 16px;
+    cursor: pointer;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    transition: background 0.1s;
+  }
+  .skipped-thumb-page:hover .skipped-remove-page {
+    display: flex;
+  }
+  .skipped-remove-page:hover {
+    background: var(--danger);
+  }
+  .skipped-open {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: rgba(0,0,0,0.7);
+    border: none;
+    color: #fff;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+    transition: background 0.1s;
+  }
+  .skipped-thumb-page:hover .skipped-open {
+    display: flex;
+  }
+  .skipped-open:hover {
+    background: var(--accent);
+  }
+  .empty-page {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 80px 20px;
+    color: var(--text3);
+  }
+  .empty-page-icon {
+    font-size: 48px;
+    opacity: 0.3;
+    margin-bottom: 16px;
+  }
+  .empty-page-text {
+    font-size: 16px;
+    color: var(--text2);
+  }
+  .loading-page {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--text3);
+    font-size: 14px;
+  }
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>Skipped Reference Photos for <span id="petName"></span> <span class="count" id="photoCount"></span></h1>
+  </div>
+  <button class="btn" onclick="window.close()">Close</button>
+</div>
+
+<div class="skipped-grid-page" id="skippedGrid">
+  <div class="loading-page">Loading...</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const urlParams = new URLSearchParams(window.location.search);
+const petName = urlParams.get('pet');
+let immichUrl = 'http://localhost:2283';
+
+function toast(msg, type = '') {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'toast show' + (type ? ' ' + type : '');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.className = 'toast', 4000);
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => r.statusText);
+    throw new Error(t);
+  }
+  return r.json();
+}
+
+async function loadConfig() {
+  try {
+    const cfg = await api('/api/config');
+    immichUrl = cfg.immich_url || 'http://localhost:2283';
+  } catch (e) {
+    console.warn('Could not load config, using default Immich URL:', e);
+  }
+}
+
+async function loadSkipped() {
+  if (!petName) {
+    document.getElementById('skippedGrid').innerHTML = '<div class="empty-page"><div class="empty-page-icon">⚠️</div><div class="empty-page-text">No pet specified</div></div>';
+    return;
+  }
+
+  document.getElementById('petName').textContent = petName;
+
+  try {
+    await loadConfig();
+    const data = await api(`/api/skip-as-ref/${encodeURIComponent(petName)}`);
+    renderSkipped(data.assets);
+    document.getElementById('photoCount').textContent = `(${data.count} photo${data.count !== 1 ? 's' : ''})`;
+  } catch (e) {
+    document.getElementById('skippedGrid').innerHTML = `<div class="empty-page"><div class="empty-page-icon">⚠️</div><div class="empty-page-text">Error loading skipped reference photos: ${e.message}</div></div>`;
+  }
+}
+
+function renderSkipped(assets) {
+  const grid = document.getElementById('skippedGrid');
+  if (!assets.length) {
+    grid.innerHTML = '<div class="empty-page"><div class="empty-page-icon">👍</div><div class="empty-page-text">No skipped reference photos for this pet</div></div>';
+    return;
+  }
+
+  grid.innerHTML = assets.map(a => `
+    <div class="skipped-thumb-page" id="skipped-${a.id}">
+      <img src="${a.thumb}" loading="lazy" onerror="this.style.opacity=0.2">
+      <a class="skipped-open" href="${immichUrl}/photos/${a.id}" target="_blank" rel="noopener" title="Open in Immich">
+        <svg viewBox="0 0 24 24" width="14" height="14">
+          <path d="M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42 9.3-9.29H14V3z" fill="currentColor"></path>
+          <path d="M5 5h6v2H7v10h10v-4h2v6H5V5z" fill="currentColor"></path>
+        </svg>
+      </a>
+      <button class="skipped-remove-page" onclick="removeSkipped('${a.id}')" title="Remove from skipped reference list">✕</button>
+    </div>
+  `).join('');
+}
+
+async function removeSkipped(assetId) {
+  if (!petName) return;
+
+  try {
+    await api(`/api/skip-as-ref/${assetId}?pet_name=${encodeURIComponent(petName)}`, { method: 'DELETE' });
+    const thumb = document.getElementById(`skipped-${assetId}`);
+    if (thumb) thumb.remove();
+
+    const grid = document.getElementById('skippedGrid');
+    if (!grid.querySelector('.skipped-thumb-page')) {
+      grid.innerHTML = '<div class="empty-page"><div class="empty-page-icon">👍</div><div class="empty-page-text">No skipped reference photos for this pet</div></div>';
+      document.getElementById('photoCount').textContent = '(0 photos)';
+    } else {
+      const remaining = grid.querySelectorAll('.skipped-thumb-page').length;
+      document.getElementById('photoCount').textContent = `(${remaining} photo${remaining !== 1 ? 's' : ''})`;
+    }
+
+    toast('Removed from skipped reference list');
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+loadSkipped();
+</script>
+</body>
+</html>

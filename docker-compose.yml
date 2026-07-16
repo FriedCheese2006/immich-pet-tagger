@@ -5,19 +5,23 @@ services:
     build:
       context: .
       args:
-        CUDA: "false"  # set to "true" for NVIDIA GPU, or ROCM: "true" for AMD
+        CUDA: "true"  # set to "true" for NVIDIA GPU, or ROCM: "true" for AMD
     container_name: immich-pet-tagger
+    # Defaults to root:root when unset.
+    user: 1000:1000
     restart: unless-stopped
     ports:
       - "127.0.0.1:2287:8000"
     environment:
-      - IMMICH_URL=http://immich-server:2283      # name of your Immich container
-      - IMMICH_API_KEY=your_api_key_here          # generate in Immich: Account Settings, API Keys. Keep this secret.
-      - IMMICH_EXTERNAL_URL=http://localhost:2283 # how your browser reaches Immich
-      - POLL_INTERVAL=300
-      - GPU_WORKERS=1
+      - GPU_WORKERS=4
+      - YOLO_MODEL=yolo26l.pt
       - YOLO_INPUT_SIZE=640
+      - SCAN_WORKERS=160
+      - CLIP_BATCH_SIZE=64
+      - YOLO_BATCH_SIZE=64
       - THRESHOLD=0.8
+    env_file:
+      - .env
     # Uncomment the section below to enable NVIDIA GPU acceleration.
     # Requires nvidia-container-toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
     # For AMD, replace driver: nvidia with driver: amdgpu and use the :rocm image tag above.
