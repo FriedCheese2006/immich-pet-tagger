@@ -16,11 +16,17 @@ Uses CLIP embeddings and a few reference photos you provide. No cloud services, 
 ## Features
 
 - **Import from Immich**: if Immich already recognizes your pet as a person, import them in one click. The tool picks up to 20 evenly distributed reference photos automatically.
-- **Find similar photos**: uses a two-stage search to surface candidates. Your reference photos are used as visual queries against Immich's smart search, and the local classifier re-ranks the results by pet probability. Falls back to text search using your description when no refs exist yet.
-- **Find candidates for "not my pets"**: samples random photos from your library, scores them with the classifier, and surfaces the top 60 most likely to confuse it for bulk review.
+- **Find references**: uses a two-stage search to surface candidates. Your reference photos are used as visual queries against Immich's smart search, and the local classifier re-ranks the results by pet probability. Falls back to text search using your description when no refs exist yet.
+- **Find missed photos**: scores photos just below the confidence threshold and surfaces them for review. Useful for finding good references to improve recall without running a full backfill.
+- **Review low confidence**: after a scan, photos the classifier wasn't fully confident about are collected and shown sorted by score with color-coded badges.
+- **Find candidates for "not a pet"**: samples photos from your library, scores them with the classifier, and surfaces the top candidates for bulk review.
+- **Tagged photos panel**: view all photos already tagged for a pet; remove a tag or mark as "not a pet" in bulk.
 - **Negative samples**: mark photos that look like your pet but aren't, to sharpen the classifier's ability to reject false positives.
+- **Multi-pet photos**: YOLO detection runs per crop, so each animal in a frame is classified separately. Photos with multiple pets are handled correctly.
 - **Date ranges**: restrict a pet to photos taken within a specific period (useful for pets that have passed away or were adopted later).
-- **Scan controls**: set the scan start date and trigger a scan from the sidebar; the last scan stats are shown live.
+- **Scan controls**: set the scan start and end date and trigger a scan from the sidebar; live per-category counts are shown while the scan runs.
+- **Open in Immich**: each thumbnail in all photo grids has a direct link to open the asset in Immich.
+- **Untag all photos**: the pet delete modal includes an option to remove all Immich face tags and create a fresh person, keeping local reference images intact so you can re-enroll immediately.
 
 ## Requirements
 
@@ -241,7 +247,7 @@ CPU-only works fine for most home libraries. Expect roughly 10x slower processin
 ## Limitations
 
 - **YOLO fallback**: when no animals are detected by YOLO, the full image is classified as a whole and only one pet can be tagged per photo
-- **Polling only**: photos are processed within 5 minutes of upload, not instantly
+- **Polling interval**: new photos are picked up on the next background poll cycle (default every 5 minutes), not instantly
 
 ## Troubleshooting
 
