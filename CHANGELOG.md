@@ -1,5 +1,44 @@
 # Changelog
 
+## v2.0.0
+
+### Breaking / workflow changes
+- **Background poller removed**: automatic periodic tagging is gone. The app is now user-driven: scans run only when triggered from the UI, and tagging is applied explicitly via scan actions.
+- **Startup now gates the main UI**: `/` serves a startup landing page and routes to `/app` only after migration, Immich connectivity validation, and model readiness checks complete.
+- **`IMMICH_URL` default changed**: default base URL is now `http://localhost:2283` (was `http://immich-server:2283`). Container-to-container deployments should set `IMMICH_URL` explicitly.
+- **Skipped data is now per-pet**: `skipped.json` moved from a single global list to a per-pet map format (with legacy list compatibility retained).
+
+### Features
+- **Discover-first scan flow**: manual scans can run in discovery mode and return per-asset predicted pet + confidence without auto-tagging.
+- **Bulk "Tag all confident" actions**: scan results can now be batch-tagged from the UI via a dedicated endpoint, with per-result accounting for already-tagged, failed, ignored, unmatched, and missing-bbox cases.
+- **Detection inspect + bbox editor**: added an in-app inspect modal for each result, including bbox adjustment before tagging or adding references.
+- **Skip-as-reference controls**: new per-pet "Skip as ref" pipeline and dedicated management view, separate from full ignore/skip behavior.
+- **Per-pet ignored asset management**: skipped assets are now managed and reviewed per pet, with dedicated endpoints and UI pages for add/list/remove.
+- **Configurable detector model**: `YOLO_MODEL` is now selectable at runtime (default `yolo26s.pt`), with config reporting that surfaces selected model and model-file presence.
+- **Class-agnostic bbox dedup in YOLO stage**: overlapping detections are deduplicated using IoU/IoA thresholds to reduce duplicate animal boxes from class-aware NMS edge cases.
+
+### Fixes
+- **Infinite status polling fixed**: startup page polling now enforces in-flight guards, backoff, max poll limits, and visibility-aware pausing to prevent runaway `/api/status` request loops.
+- **Fail-fast startup diagnostics**: startup now reports explicit errors for Immich connection failures and model initialization failures/timeouts instead of silently stalling.
+- **Reference migration robustness**: startup ref migration now tolerates permission errors when legacy files are not writable, allowing the service to continue running.
+- **More accurate low-confidence filtering**: low-confidence scan review now respects per-pet skipped assets (plus negatives), preventing ignored assets from reappearing.
+- **Reliable in-app preview for inspect flow**: added a browser-safe full-asset preview proxy endpoint for formats that are inconsistent when loaded directly.
+- **Face assignment observability**: face create attempts now emit structured app-side audit events and rotating JSONL logs under `/data/logs/face_assignment.log`.
+
+### Infrastructure / deployment
+- **Compose and env flow updated**: added `.env.example`, switched compose to `env_file`, and expanded runtime tuning knobs (including detector model and batch sizing).
+- **Runtime write paths hardened**: image now pre-creates `/data` and `/data/.cache` with permissive runtime-safe permissions to support arbitrary UID/GID container users.
+- **Container defaults adjusted for local ownership**: compose includes explicit non-root user mapping and persistent cache location under the mounted data volume.
+
+### API additions and behavior changes
+- **New endpoints**: `GET /skipped/{pet_name}`, `DELETE /skipped/{asset_id}`, `GET /skip-as-ref/{pet_name}`, `POST /skip-as-ref`, `DELETE /skip-as-ref/{asset_id}`, `POST /scan/tag`, and `GET /asset-full/{asset_id}`.
+- **Extended config payload**: `/api/config` now returns `yolo_model`, `yolo_file_present`, `clip_file_present`, and `model_files_present` in addition to readiness/error fields.
+- **`POST /scan` upgraded**: scan requests now support `discover_only` and optional per-pet targeting.
+
+### Developer experience
+- **Test coverage expanded**: tests now cover per-pet skipped/skip-as-ref data behavior and related legacy compatibility paths.
+
+
 ## v1.5.1
 
 ### Fixes
